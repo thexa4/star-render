@@ -1,0 +1,8 @@
+#!/bin/bash
+
+set -euo pipefail
+
+mkdir -p selected
+while read -r file; do
+        echo "[ -f \"selected/$file.bin\" ] || (bzcat "csvs/$file" | ./select-data > \"selected/$file.tmp\" && mv \"selected/$file.tmp\" \"selected/$file.bin\"); echo $file"
+done <parts.txt | xargs -P$(( $(nproc) - $(nproc) / 8)) -I % bash -c % | pv -l --size="$(wc -l parts.txt | cut -d' ' -f1)" --name="downloads" >/dev/null

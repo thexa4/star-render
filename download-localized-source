@@ -1,0 +1,7 @@
+#!/bin/bash
+
+set -euo pipefail
+
+while read -r file; do
+	echo "[ -f \"csvs/$file\" ] || (curl --silent --compressed \"http://[2a0c:8187:0:100::146]/$file\" | grep -v \"\#\" | ./csv_hilbert_sort.py --verbose --hilbert_order 15 /dev/stdin | pbzip2 -c -p1 > \"csvs/$file.tmp\" && mv \"csvs/$file.tmp\" \"csvs/$file\"); echo $file"
+done <parts.txt | xargs -P$(( $(nproc) - $(nproc) / 8)) -I % bash -c % | pv -l --size="$(wc -l parts.txt | cut -d' ' -f1)" --name="downloads" >/dev/null
