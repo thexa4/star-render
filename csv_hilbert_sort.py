@@ -5,6 +5,10 @@ Simple command line tool for reading in a csv that contains columns named
 Hilbert index.
 '''
 
+# Made by Jonathan Dursi
+# https://dursi.ca/
+# Unknown license
+
 import argparse
 import sys
 import pandas as pd

@@ -10,6 +10,7 @@
 #include <string>
 #include "ciedata.h"
 #include "star_record.hpp"
+#include "temperature_lookup.hpp"
 
 struct COORD {
 	float x;
@@ -58,6 +59,13 @@ struct CUBEMAP {
 	IMAGE<T, META, WIDTH, HEIGHT> back;
 	IMAGE<T, META, WIDTH, HEIGHT> top;
 	IMAGE<T, META, WIDTH, HEIGHT> bottom;
+
+	IMAGE<T, META, WIDTH, HEIGHT> * get_face(int i) {
+		if (i < 0 || i > 5)
+			return NULL;
+		IMAGE<T, META, WIDTH, HEIGHT> *faces[] = {&top, &bottom, &left, &right, &front, &back};
+		return faces[i];
+	}
 
 	PIXEL<T, META>& lookup(float lat, float lng) {
 		lat *= 3.14159265358979323846 / 180.0;
@@ -153,6 +161,9 @@ double slice_colormap(IMAGE<double, META, WIDTH, HEIGHT> &source, IMAGE<float, E
 			double r = source_pixel.x * 1.4628067 + source_pixel.y * -0.1840623 + source_pixel.z * -0.2743606;
 			double g = source_pixel.x * -0.5217933 + source_pixel.y * 1.4472381 + source_pixel.z * 0.0677227;
 			double b = source_pixel.x * 0.0349342 + source_pixel.y * -0.0968930 + source_pixel.z * 1.2884099;
+			r = source_pixel.x;
+			g = source_pixel.y;
+			b = source_pixel.z;
 			dest.lines[y].pixels[x].x = (float)std::max(0.0, r);
 			dest.lines[y].pixels[x].y = (float)std::max(0.0, g);
 			dest.lines[y].pixels[x].z = (float)std::max(0.0, b);
@@ -229,13 +240,7 @@ const int TEMPERATURE_SPECTRAL_SAMPLES = 470;
 const double TEMPERATURE_SPECTRUM_START = 380.0;
 const double TEMPERATURE_SPECTRUM_END = 830.0;
 PIXEL<double, EMPTY> temperatures[TEMPERATURE_MAX];
-int inverse_temperatures[10000];
 void precompute_temperatures() {
-	for (int i = 0; i < 10000; i++)
-		inverse_temperatures[i] = 5000;
-
-	int inverse_filled_until = 10000;
-
 	for (int temperature = 0; temperature < TEMPERATURE_MAX; temperature++) {
 		if (temperature < 470) {
 			temperatures[temperature].x = 1;
@@ -266,40 +271,55 @@ void precompute_temperatures() {
 		temperatures[temperature].y /= scale;
 		temperatures[temperature].z /= scale;
 		//std::cout << "Temperature: " << temperature << "K: " << temperatures[temperature].x << " " << temperatures[temperature].y << " " << temperatures[temperature].z << std::endl;
-
-		double ratio = temperatures[temperature].x / temperatures[temperature].z;
-		int lookup = (int)std::round(ratio * 4000);
-		if (lookup < inverse_filled_until) {
-			for (int i = inverse_filled_until - 1; i >= std::max(0, lookup); i--) {
-				inverse_temperatures[i] = temperature;
-			}
-			inverse_filled_until = lookup;
-		}
 	}
 }
-int lookup_temperature(double x, double z) {
-	if (std::isnan(z) || std::isnan(x) || z <= 0)
-		return 5000;
+int lookup_temperature(double x, double y) {
+	if (std::isnan(x) && std::isnan(y))
+		return 3200;
 
-	double ratio = x / z;
-	int lookup = (int)std::round(ratio * 4000);
-	if (lookup < 0)
-		lookup = 0;
-	if (lookup >= 10000)
-		lookup = 10000-1;
+	const int x_size = sizeof(temperature.x_lookup) / sizeof(temperature.x_lookup[0]);
+	const int y_size = sizeof(temperature.y_lookup) / sizeof(temperature.y_lookup[0]);
 
-	return inverse_temperatures[lookup];
+	if (!std::isnan(x))
+		x = (x - temperature.start_x) / (temperature.end_x - temperature.start_x) * x_size;
+	if (!std::isnan(y))
+		y = (y - temperature.start_y) / (temperature.end_y - temperature.start_y) * y_size;
+
+	double y_result = nan("");
+	if (!std::isnan(y)) {
+		int left = std::max(0.0, std::min(y_size - 2.0, y));
+		double frac = std::max(0.0, std::min(1.0, y - left));
+
+		y_result = temperature.y_lookup[left] * (1 - frac) + temperature.y_lookup[left + 1] * frac;
+	}
+	double x_result = nan("");
+	if (!std::isnan(x)) {
+		int left = std::max(0.0, std::min(x_size - 2.0, x));
+		double frac = std::max(0.0, std::min(1.0, x - left));
+
+		x_result = temperature.x_lookup[left] * (1 - frac) + temperature.x_lookup[left + 1] * frac;
+	}
+
+	if (std::isnan(x_result))
+		return (int)std::round(y_result);
+	if (std::isnan(y_result))
+		return (int)std::round(x_result);
+
+	return (int)std::round((y_result + x_result) / 2);
 }
 
 struct Metadata {
-	short max_sightings;
+	short max_sightings = 0;
+	int num_samples = 0;
+	long sum_sightings = 0;
 };
 
 long samples_done = 0;
 #define OUTPUT_SIZE 2048
-#define BATCH_SIZE 32
+#define BATCH_SIZE 4
 CUBEMAP<double, Metadata, OUTPUT_SIZE, OUTPUT_SIZE> compute_buffer;
 CUBEMAP<float, EMPTY, OUTPUT_SIZE, OUTPUT_SIZE> file_buffer;
+
 int main() {
 	precompute_temperatures();
 
@@ -310,18 +330,7 @@ int main() {
 			Star &s = buffer[i];
 
 			if (std::isnan(s.teff_gspphot)) {
-				if (std::isnan(s.phot_rp_mean_mag) || std::isnan(s.phot_bp_mean_mag)) {
-					s.phot_g_mean_mag -= 10;
-					s.phot_bp_mean_mag -= 10;
-					s.phot_rp_mean_mag -= 10;
-					s.teff_gspphot = 3200;
-				} else {
-					// looks prettier
-					s.teff_gspphot = (double)(lookup_temperature(s.phot_rp_mean_mag * 1.20, s.phot_bp_mean_mag));
-					//s.phot_g_mean_mag -= 8;
-					//s.phot_bp_mean_mag -= 8;
-					//s.phot_rp_mean_mag -= 8;
-				}
+				s.teff_gspphot = (double)(lookup_temperature(s.phot_rp_mean_mag / s.phot_g_mean_mag, s.phot_bp_mean_mag / s.phot_g_mean_mag));
 			}
 
 			if (std::isnan(s.phot_g_mean_mag)) {
@@ -337,7 +346,7 @@ int main() {
 				}
 				if (count == 0)
 					continue;
-				s.phot_g_mean_mag = intensity / count - 4;
+				s.phot_g_mean_mag = intensity / count;
 			}
 
 			auto &dest = compute_buffer.lookup(s.dec, s.ra);
@@ -352,26 +361,76 @@ int main() {
 
 			double intensity = pow(2.51188643151, s.phot_g_mean_mag);
 
-			if (s.astrometric_n_obs_al < 15)
-				intensity = intensity * 15.0 / s.astrometric_n_obs_al;
-
 			star_color.x *= intensity;
 			star_color.y *= intensity;
 			star_color.z *= intensity;
 			dest.add(star_color);
 
 			dest.meta.max_sightings = std::max(dest.meta.max_sightings, s.astrometric_n_obs_al);
+			dest.meta.num_samples++;
+			dest.meta.sum_sightings += s.astrometric_n_obs_al;
 
 			samples_done++;
-			if ((samples_done % 250000000) == 0) {
-				std::cout << samples_done << " stars rendered" << std::endl;
+			if ((samples_done % 500000000) == 0) {
 				render_image(compute_buffer, file_buffer);
 			}
 		}
 		count = fread(&buffer, sizeof(buffer[0]), BATCH_SIZE, stdin);
 	}
 
+	const int array_len = 1024;
+	double sighting_intensity[array_len];
+	long sighting_count[array_len];
+	double intensity_sum[array_len];
+	int intensity_count[array_len];
+	for (int i = 0; i < array_len; i++) {
+		sighting_intensity[i] = 0;
+		sighting_count[i] = 0;
+		intensity_sum[i] = 0;
+		intensity_count[i] = 0;
+	}
+
+	for (int face = 0; face < 6; face++) {
+		IMAGE<double, Metadata, 2048, 2048> &img = *compute_buffer.get_face(face);
+		for (int y = 0; y < OUTPUT_SIZE; y++) {
+			for (int x = 0; x < OUTPUT_SIZE; x++) {
+				auto &p = img.lines[y].pixels[x];
+
+				double avg = (p.x + p.y + p.z) / 3.0;
+				if (p.meta.max_sightings < array_len && p.meta.max_sightings >= 0) {
+					sighting_intensity[p.meta.max_sightings] += avg;
+					sighting_count[p.meta.max_sightings]++;
+				}
+
+				p.x = avg / 100000000;
+				p.y = p.meta.max_sightings;
+				p.z = 0;
+
+				if (p.meta.num_samples > 0) {
+					int avg_sightings = (int)std::round((double)p.meta.sum_sightings / (double)p.meta.num_samples);
+					if (avg_sightings >= 0 && avg_sightings < array_len) {
+						intensity_sum[avg_sightings] += avg;
+						intensity_count[avg_sightings]++;
+					}
+					p.z = avg_sightings;
+				}
+			}
+		}
+	}
 	render_image(compute_buffer, file_buffer);
+
+
+	for (int i = 0; i < array_len; i++) {
+		int max_intensity = 0;
+		if (sighting_count[i] > 0)
+			max_intensity = (int)(sighting_intensity[i] / sighting_count[i] / 1000000);
+
+		int avg_intensity = 0;
+		if (intensity_count[i] > 0)
+			avg_intensity = (int)(intensity_sum[i] / intensity_count[i] / 1000000);
+
+		std::cout << max_intensity << ", " << avg_intensity << std::endl;
+	}
 
 	return 0;
 }
