@@ -7,6 +7,7 @@
 #include <OpenEXR/ImfOutputFile.h>
 #include <OpenEXR/ImfEnvmapAttribute.h>
 #include <math.h>
+#include <cmath>
 #include <string>
 #include "ciedata.h"
 #include "star_record.hpp"
@@ -17,8 +18,30 @@ struct COORD {
 	float y;
 	float z;
 
+	COORD() : x(0), y(0), z(0) {}
+	COORD(float x, float y, float z): x(x), y(y), z(z) {}
+
 	float dot(COORD &other) {
 		return x * other.x + y * other.y + z * other.z;
+	}
+
+	COORD cross(COORD &other) {
+		COORD result;
+		result.x = y * other.z - z * other.y;
+		result.y = z * other.x - x * other.z;
+		result.z = x * other.y - y * other.x;
+		return result;
+	}
+
+	COORD normalized() {
+		if (x == 0 && y == 0 && z == 0)
+			return *this;
+		float length = sqrt(x * x + y * y + z * z);
+		COORD result;
+		result.x = x / length;
+		result.y = y / length;
+		result.z = z / length;
+		return result;
 	}
 };
 
@@ -51,86 +74,9 @@ struct IMAGE {
 	SCANLINE<T, META, WIDTH> lines[HEIGHT];
 };
 
-template<typename T, typename META, int WIDTH, int HEIGHT>
-struct CUBEMAP {
-	IMAGE<T, META, WIDTH, HEIGHT> left;
-	IMAGE<T, META, WIDTH, HEIGHT> front;
-	IMAGE<T, META, WIDTH, HEIGHT> right;
-	IMAGE<T, META, WIDTH, HEIGHT> back;
-	IMAGE<T, META, WIDTH, HEIGHT> top;
-	IMAGE<T, META, WIDTH, HEIGHT> bottom;
-
-	IMAGE<T, META, WIDTH, HEIGHT> * get_face(int i) {
-		if (i < 0 || i > 5)
-			return NULL;
-		IMAGE<T, META, WIDTH, HEIGHT> *faces[] = {&top, &bottom, &left, &right, &front, &back};
-		return faces[i];
-	}
-
-	PIXEL<T, META>& lookup(float lat, float lng) {
-		lat *= 3.14159265358979323846 / 180.0;
-		lng *= 3.14159265358979323846 / 180.0;
-
-		COORD lookup_coord;
-		float cos_lat = cos(lat);
-		lookup_coord.x = cos_lat * cos(lng);
-		lookup_coord.y = sin(lat);
-		lookup_coord.z = cos_lat * sin(lng);
-
-		IMAGE<T, META, WIDTH, HEIGHT> *faces[] = {&top, &bottom, &left, &right, &front, &back};
-		COORD face_coords[] = {
-			(COORD){0, 0, 1},
-			(COORD){0, 0, -1},
-			(COORD){-1, 0, 0},
-			(COORD){1, 0, 0},
-			(COORD){0, -1, 0},
-			(COORD){0, 1, 0},
-		};
-		COORD face_left_coord[] = {
-			(COORD){0, 1, 0},
-			(COORD){0, 1, 0},
-			(COORD){0, 1, 0},
-			(COORD){0, 1, 0},
-			(COORD){1, 0, 0},
-			(COORD){1, 0, 0},
-		};
-		COORD face_up_coord[] = {
-			(COORD){1, 0, 0},
-			(COORD){1, 0, 0},
-			(COORD){0, 0, 1},
-			(COORD){0, 0, 1},
-			(COORD){0, 0, 1},
-			(COORD){0, 0, 1},
-		};
-
-		int best_index = -1;
-		float best_score = -2;
-		for (int i = 0; i < 6; i++) {
-			float score = lookup_coord.dot(face_coords[i]);
-			if (score > best_score) {
-				best_index = i;
-				best_score = score;
-			}
-		}
-		auto face = faces[best_index];
-
-		float left = lookup_coord.dot(face_left_coord[best_index]) / best_score;
-		float up = lookup_coord.dot(face_up_coord[best_index]) / best_score;
-		int x = (int)floor(((left + 1.0) / 2.0) * WIDTH);
-		int y = (int)floor(((up + 1.0) / 2.0) * HEIGHT);
-
-		/*if (x < 0 || x >= WIDTH || y < 0 || y >= HEIGHT || best_index == 5) {
-			std::cout << "lookup: " << ((left + 1.0) / 2.0) << ", " << ((up + 1.0) / 2.0) << " @" << best_index << std::endl;
-			std::cout << "input: " << lookup_coord.dot(face_left_coord[best_index]) << ", " << lookup_coord.dot(face_up_coord[best_index]) << ", " << best_score << std::endl;
-			std::cout << "left: " << left << ", up: " << up << std::endl;
-		}*/
-
-		return face->lines[y].pixels[x];
-	}
-};
-
 template<int WIDTH, int HEIGHT>
 void slice_downscale(IMAGE<float, EMPTY, WIDTH, HEIGHT> &dest, float maximum) {
+
 	for (int y = 0; y < HEIGHT; y++) {
 		for (int x = 0; x < WIDTH; x++) {
 			auto &pixel = dest.lines[y].pixels[x];
@@ -191,49 +137,25 @@ void write_image_slice(const char *filename, IMAGE<float, EMPTY, WIDTH, HEIGHT> 
 	framebuffer.insert("B", Imf_2_5::Slice(Imf_2_5::FLOAT, (char *)&image.lines[0].pixels[0].z, sizeof(image.lines[0].pixels[0]), sizeof(image.lines[0])));
 
 	file.setFrameBuffer(framebuffer);
-	file.writePixels(WIDTH);
+	file.writePixels(HEIGHT);
 }
 
 template<typename META, int WIDTH, int HEIGHT>
-void render_image(CUBEMAP<double, META, WIDTH, HEIGHT> &compute_buffer, CUBEMAP<float, EMPTY, WIDTH, HEIGHT> &file_buffer) {
+void render_image(IMAGE<double, META, WIDTH, HEIGHT> &compute_buffer, IMAGE<float, EMPTY, WIDTH, HEIGHT> &file_buffer) {
 	//std::cout << "Normalizing" << std::endl;
 
 	double maximum = 0.00001;
-	maximum = std::max(maximum, slice_colormap(compute_buffer.top, file_buffer.top));
-	maximum = std::max(maximum, slice_colormap(compute_buffer.bottom, file_buffer.bottom));
-	maximum = std::max(maximum, slice_colormap(compute_buffer.left, file_buffer.left));
-	maximum = std::max(maximum, slice_colormap(compute_buffer.front, file_buffer.front));
-	maximum = std::max(maximum, slice_colormap(compute_buffer.right, file_buffer.right));
-	maximum = std::max(maximum, slice_colormap(compute_buffer.back, file_buffer.back));
+	maximum = std::max(maximum, slice_colormap(compute_buffer, file_buffer));
 
-	slice_downscale(file_buffer.top, (float)maximum);
-	slice_downscale(file_buffer.bottom, (float)maximum);
-	slice_downscale(file_buffer.left, (float)maximum);
-	slice_downscale(file_buffer.front, (float)maximum);
-	slice_downscale(file_buffer.right, (float)maximum);
-	slice_downscale(file_buffer.back, (float)maximum);
+	std::cout << "Downscaling" << std::endl;
+	slice_downscale(file_buffer, (float)maximum);
 
-	//std::cout << "Writing result";
+	std::cout << "Writing result";
 
-	write_image_slice("skycube-top.tmp", file_buffer.top);
-	//std::cout << '.';
-	write_image_slice("skycube-bottom.tmp", file_buffer.bottom);
-	//std::cout << '.';
-	write_image_slice("skycube-left.tmp", file_buffer.left);
-	//std::cout << '.';
-	write_image_slice("skycube-front.tmp", file_buffer.front);
-	//std::cout << '.';
-	write_image_slice("skycube-right.tmp", file_buffer.right);
-	//std::cout << '.';
-	write_image_slice("skycube-back.tmp", file_buffer.back);
-	rename("skycube-top.tmp", "skycube-top.exr");
-	rename("skycube-bottom.tmp", "skycube-bottom.exr");
-	rename("skycube-left.tmp", "skycube-left.exr");
-	rename("skycube-front.tmp", "skycube-front.exr");
-	rename("skycube-right.tmp", "skycube-right.exr");
-	rename("skycube-back.tmp", "skycube-back.exr");
+	write_image_slice("canvas.tmp", file_buffer);
+	rename("canvas.tmp", "canvas.exr");
 
-	//std::cout << "done" << std::endl;
+	std::cout << "done" << std::endl;
 }
 const int TEMPERATURE_MAX = 50000;
 const int TEMPERATURE_SPECTRAL_SAMPLES = 470;
@@ -315,16 +237,45 @@ struct Metadata {
 };
 
 long samples_done = 0;
-#define OUTPUT_SIZE 2048
+//18260 × 6449
+#define HEIGHT 6449
+#define WIDTH 18260
 #define BATCH_SIZE 4
-CUBEMAP<double, Metadata, OUTPUT_SIZE, OUTPUT_SIZE> compute_buffer;
-CUBEMAP<float, EMPTY, OUTPUT_SIZE, OUTPUT_SIZE> file_buffer;
+IMAGE<double, Metadata, WIDTH, HEIGHT> &compute_buffer = *new IMAGE<double, Metadata, WIDTH, HEIGHT>{};
+IMAGE<float, EMPTY, WIDTH, HEIGHT> &file_buffer = *new IMAGE<float, EMPTY, WIDTH, HEIGHT>{};
+
 
 int main() {
 	precompute_temperatures();
 
 	Star buffer[BATCH_SIZE];
 	size_t count = fread(&buffer, sizeof(buffer[0]), BATCH_SIZE, stdin);
+
+	COORD fwd(-0.2, -0.6, -0.5);
+	fwd = fwd.normalized();
+	//COORD desired_up(-0.7, -0.25, 0.6);
+	//COORD desired_up(0.196116, 0.588348, -0.784465);
+	//COORD desired_up(-0.702864, 0.578829, -0.413449);
+	COORD desired_up(-0.5, 0.6, 0);
+	desired_up = desired_up.normalized();
+	float zoom = 1.5;
+
+	COORD right = fwd.cross(desired_up).normalized();
+	COORD up = right.cross(fwd).normalized();
+
+	std::cout << "up: " << up.x << "," << up.y << "," << up.z << std::endl;
+
+	float up_scale = (float)HEIGHT / (float)WIDTH;
+	right.x = right.x * zoom;
+	right.y = right.y * zoom;
+	right.z = right.z * zoom;
+	up.x = up.x * zoom / up_scale;
+	up.y = up.y * zoom / up_scale;
+	up.z = up.z * zoom / up_scale;
+
+	long hits = 0;
+	long total_stars = 0;
+
 	while(count > 0) {
 		for (int i = 0; i < count; i++) {
 			Star &s = buffer[i];
@@ -349,7 +300,39 @@ int main() {
 				s.phot_g_mean_mag = intensity / count;
 			}
 
-			auto &dest = compute_buffer.lookup(s.dec, s.ra);
+			float lat = s.dec * 3.14159265358979323846 / 180.0;
+			float lng = s.ra * 3.14159265358979323846 / 180.0;
+
+			float cos_lat = cos(lat);
+			COORD coord (
+				cos_lat * cos(lng),
+				sin(lat),
+				cos_lat * sin(lng)
+			);
+
+			float depth = coord.dot(fwd);
+			float coord_u = coord.dot(up);
+			float coord_v = coord.dot(right);
+
+			total_stars++;
+			if (depth < 0)
+				continue;
+
+			//std::cout << "off: " << offset_x << ";" << offset_y << std::endl;
+
+			//std::cout << "c: " << coord_u << ";" << coord_v << std::endl;
+			if (coord_u < -1.0 || coord_u > 1.0 || coord_v < -1.0 || coord_v > 1.0)
+				continue;
+			hits++;
+
+			int pos_y = (int)round((coord_u + 1.0) * HEIGHT / 2.0);
+			int pos_x = (int)round((coord_v + 1.0) * WIDTH / 2.0);
+			if (pos_x < 0 || pos_x >= WIDTH)
+				continue;
+			if (pos_y < 0 || pos_y >= HEIGHT)
+				continue;
+
+			auto &dest = compute_buffer.lines[pos_y].pixels[pos_x];
 
 			int temperature = (int)round(s.teff_gspphot);
 			if (temperature < 0 || temperature > 50000) {
@@ -371,12 +354,13 @@ int main() {
 			dest.meta.sum_sightings += s.astrometric_n_obs_al;
 
 			samples_done++;
-			if ((samples_done % 500000000) == 0) {
-				render_image(compute_buffer, file_buffer);
-			}
+			//if ((samples_done % 500000000) == 0) {
+			//	render_image(compute_buffer, file_buffer);
+			//}
 		}
 		count = fread(&buffer, sizeof(buffer[0]), BATCH_SIZE, stdin);
 	}
+	std::cout << "Percentage in view: " << round(((float)hits / (float)total_stars) * 100) << "%" << std::endl;
 
 	const int array_len = 1024;
 	double sighting_intensity[array_len];
@@ -390,47 +374,7 @@ int main() {
 		intensity_count[i] = 0;
 	}
 
-	for (int face = 0; face < 6; face++) {
-		IMAGE<double, Metadata, 2048, 2048> &img = *compute_buffer.get_face(face);
-		for (int y = 0; y < OUTPUT_SIZE; y++) {
-			for (int x = 0; x < OUTPUT_SIZE; x++) {
-				auto &p = img.lines[y].pixels[x];
-
-				double avg = (p.x + p.y + p.z) / 3.0;
-				if (p.meta.max_sightings < array_len && p.meta.max_sightings >= 0) {
-					sighting_intensity[p.meta.max_sightings] += avg;
-					sighting_count[p.meta.max_sightings]++;
-				}
-
-				p.x = avg / 100000000;
-				p.y = std::min((short int)250, p.meta.max_sightings);
-				p.z = 0;
-
-				if (p.meta.num_samples > 0) {
-					int avg_sightings = (int)std::round((double)p.meta.sum_sightings / (double)p.meta.num_samples);
-					if (avg_sightings >= 0 && avg_sightings < array_len) {
-						intensity_sum[avg_sightings] += avg;
-						intensity_count[avg_sightings]++;
-					}
-					p.z = std::min(135, avg_sightings);
-				}
-			}
-		}
-	}
 	render_image(compute_buffer, file_buffer);
-
-
-	for (int i = 0; i < array_len; i++) {
-		int max_intensity = 0;
-		if (sighting_count[i] > 0)
-			max_intensity = (int)(sighting_intensity[i] / sighting_count[i] / 1000000);
-
-		int avg_intensity = 0;
-		if (intensity_count[i] > 0)
-			avg_intensity = (int)(intensity_sum[i] / intensity_count[i] / 1000000);
-
-		std::cout << max_intensity << ", " << avg_intensity << std::endl;
-	}
 
 	return 0;
 }
